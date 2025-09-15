@@ -22,6 +22,13 @@
    
    Fractional sample delay compensation by sampling frequency tuning:
         Mikko Laakso, "Multichannel coherent receiver on the RTL-SDR" 2019
+
+  CHANGELOG:
+   ----------
+   Gabriel St Angel <gabriel.st.angel@aero.org> - 2025-09-13
+   - Added optional logger parameter with stdout fallback for subprocess logging 
+   - Fix some linter issues
+   - Add shmemIface.py rrom https://github.com/krakenrf/krakensdr_doa/blob/main/_sdr/_receiver/shmemIface.py
 """
 # Import built-in modules
 import logging
@@ -45,7 +52,7 @@ from numba import jit, njit
 
 # Import HeIMDALL modules
 from iq_header import IQHeader
-from shmemIface import outShmemIface, inShmemIface
+from shmemIface import outShmemIface, inShmemIface, TERMINATE
 import inter_module_messages
 
 # Linear curve definition for curve fitting
@@ -54,10 +61,19 @@ def linear_func(x, a, b):
 
 class delaySynchronizer():
     
-    def __init__(self):
+    def __init__(self, logger=None):
         
-        logging.basicConfig(level=10)
-        self.logger = logging.getLogger(__name__)
+        if logger is not None:
+            self.logger = logger
+        else:
+            # Configure logger to output to stderr for subprocess capture
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                stream=sys.stderr
+            )
+            self.logger = logging.getLogger(__name__)
+            self.logger.setLevel(logging.DEBUG)
 
         self.module_identifier = 5 # Inter-module message module identifier        
         self.in_shmem_iface = None
@@ -139,6 +155,7 @@ class delaySynchronizer():
         self.iq_diff_ref = np.ones(self.M, dtype=np.complex64) # Reference IQ difference vector used in the tracking mode
         
         self.logger.info("Delay synchronizer initialized")
+        self.logger.debug("DSYNC: Initialization complete, entering main processing loop")
     
     def _read_config_file(self, config_filename):
         """
@@ -269,18 +286,27 @@ class delaySynchronizer():
         """
             Close the communication and data interfaces that are opened during the start of the module
         """
-        if self.in_shmem_iface is not None:
-            self.in_shmem_iface.destory_sm_buffer()
+        try:
+            if self.in_shmem_iface is not None:
+                self.in_shmem_iface.destory_sm_buffer()
+        except Exception as e:
+            self.logger.warning(f"Error closing input shared memory interface: {e}")
                 
-        if self.out_shmem_iface_iq is not None:
-            self.out_shmem_iface_iq.send_ctr_terminate()
-            sleep(2)
-            self.out_shmem_iface_iq.destory_sm_buffer()        
+        try:
+            if self.out_shmem_iface_iq is not None:
+                self.out_shmem_iface_iq.send_ctr_terminate()
+                sleep(2)
+                self.out_shmem_iface_iq.destory_sm_buffer()
+        except Exception as e:
+            self.logger.warning(f"Error closing IQ output shared memory interface: {e}")
 
-        if self.out_shmem_iface_hwc is not None:
-            self.out_shmem_iface_hwc.send_ctr_terminate()
-            sleep(2)
-            self.out_shmem_iface_hwc.destory_sm_buffer()  
+        try:
+            if self.out_shmem_iface_hwc is not None:
+                self.out_shmem_iface_hwc.send_ctr_terminate()
+                sleep(2)
+                self.out_shmem_iface_hwc.destory_sm_buffer()
+        except Exception as e:
+            self.logger.warning(f"Error closing HWC output shared memory interface: {e}")  
             
         self.logger.info("Interfaces are closed")
     def calc_iq_sync(self, iq_samples):
@@ -426,6 +452,7 @@ class delaySynchronizer():
         """
             Start the main processing loop
         """
+        self.logger.debug("delaySyncronizer: Entering main processing loop")
         while True:
             sample_sync_flag = False
             iq_sync_flag     = False
@@ -439,6 +466,9 @@ class delaySynchronizer():
             active_buff_index_dec = self.in_shmem_iface.wait_buff_free()  
             if active_buff_index_dec < 0 or active_buff_index_dec > 1:
                 self.logger.critical("Failed to acquire new data frame, exiting..")
+                break;
+            elif active_buff_index_dec == TERMINATE:
+                self.logger.info("Received TERMINATE signal, shutting down gracefully..")
                 break;          
             iq_frame_buffer_in = self.in_shmem_iface.buffers[active_buff_index_dec]
 
@@ -816,7 +846,10 @@ def copy_iq(iq_samples_in, iq_samples_out, M):
 
 if __name__ == '__main__':
     delay_synchronizer_inst0 = delaySynchronizer()
-    if delay_synchronizer_inst0.open_interfaces() == 0:
-        delay_synchronizer_inst0.start()
-    
-    delay_synchronizer_inst0.close_interfaces()
+    try:
+        if delay_synchronizer_inst0.open_interfaces() == 0:
+            delay_synchronizer_inst0.start()
+    except Exception as e:
+        delay_synchronizer_inst0.logger.error(f"Unexpected error: {e}")
+    finally:
+        delay_synchronizer_inst0.close_interfaces()

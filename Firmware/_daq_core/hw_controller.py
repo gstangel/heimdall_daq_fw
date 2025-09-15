@@ -18,11 +18,19 @@
 
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+   CHANGELOG:
+   ----------
+   Gabriel St Angel <gabriel.st.angel@aero.org> - 2025-09-13
+   - Added optional logger parameter with stdout fallback for subprocess logging 
+   - Fix some linter issues
+   - Add shmemIface.py rrom https://github.com/krakenrf/krakensdr_doa/blob/main/_sdr/_receiver/shmemIface.py
 """
 # Import built in modules
 from struct import pack, unpack
 import threading
 import logging
+import sys
 
 # Import third-party modules
 import numpy as np
@@ -41,10 +49,19 @@ ctr_request_condition = threading.Condition()
 
 class HWC():
     
-    def __init__(self):                 
+    def __init__(self, logger=None):                 
         
-        logging.basicConfig(level=10)
-        self.logger = logging.getLogger(__name__)
+        if logger is not None:
+            self.logger = logger
+            self.logger.setLevel(self.log_level)
+        else:
+            # Modification: If not passed a logger, configure a logger that streams to stderr for subproccess monitoring
+            logging.basicConfig(
+                level=logging.DEBUG,
+                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                stream=sys.stderr
+            )
+            self.logger = logging.getLogger(__name__)
         self.log_level=0 # Set from the ini file        
         self.module_identifier = 6 # Inter-module message module identifier
         self.track_lock_ctr_fname = "_data_control/iq_track_lock"
@@ -92,11 +109,9 @@ class HWC():
             Block sizes measured in bytes        
             1 IQ sample consist of 2 32bit float number
         """
-        # Configure logger                        
-        self.logger.setLevel(self.log_level)
 
         # Control interface server
-        self.ctr_iface_server = CtrIfaceServer(self.M)
+        self.ctr_iface_server = CtrIfaceServer(self.M, self.logger)
         self.ctr_iface_server.start()
 
         self.logger.info("Antenna channles {:d}".format(self.M))
@@ -165,12 +180,12 @@ class HWC():
         gains_init_ind = list(map(int, gains_init_str))
         # -> Channel number check
         if len(gains_init_ind) != self.M:
-            logging.warning("Channel number missmatch when reading initial gain values")
-            logging.warning("Gain values leaved in default state")
+            self.logger.warning("Channel number missmatch when reading initial gain values")
+            self.logger.warning("Gain values leaved in default state")
             self.gains=[0]*self.M
             self.last_gains=[0]*self.M
-            logging.warning("GAINS: {0}".format(self.gains))
-            logging.warning("Last GAINS: {0}".format(self.last_gains))
+            self.logger.warning("GAINS: {0}".format(self.gains))
+            self.logger.warning("Last GAINS: {0}".format(self.last_gains))
         else:
             self.gains=[]
             self.last_gains=[]
@@ -179,7 +194,7 @@ class HWC():
                     self.gains.append(self.valid_gains.index(gain_item))
                     self.last_gains.append(self.valid_gains.index(gain_item))
             except ValueError:
-                logging.error("Improper inital gain values are given, set all to 0")
+                self.logger.error("Improper inital gain values are given, set all to 0")
                 self.gains=[0]*self.M
                 self.last_gains=[0]*self.M
 
@@ -207,7 +222,7 @@ class HWC():
         # Initialize shared memory interface
         self.in_shmem_iface = inShmemIface("delay_sync_hwc")
         if not self.in_shmem_iface.init_ok:
-            logging.critical("Shared memory initialization failed")
+            self.logger.critical("Shared memory initialization failed")
             return -3
         # ADPIS
         if self.en_adpis:
@@ -217,7 +232,7 @@ class HWC():
                 # Initialize DAC controller
                 self.iq_mod = DACController(iface="I2C")
                 if not self.iq_mod.init_status:
-                    logging.critical("DAC Controller initialization failed")
+                    self.logger.critical("DAC Controller initialization failed")
                     return -2
                 self.iq_mod.logger.setLevel(self.log_level)
 
@@ -225,7 +240,7 @@ class HWC():
                 for m in range(self.M-1):
                     self.iq_mod.set_IQ_value(0.5, 0.5, m)
             except:
-                logging.error("DAC Controller initialization failed")
+                self.logger.error("DAC Controller initialization failed")
         return 0
     
     def close(self):
@@ -414,8 +429,8 @@ class HWC():
             # Obtained new data                                    
             active_buff_index = self.in_shmem_iface.wait_buff_free()            
             if active_buff_index < 0 or active_buff_index > 1:
-                logging.critical("Failed to acquire iq frame, exiting ..")
-                break;          
+                self.logger.critical("Failed to acquire iq frame, exiting ..")
+                break          
 
             buffer = self.in_shmem_iface.buffers[active_buff_index]
             iq_header_bytes = buffer[0:1024].tobytes()
@@ -423,7 +438,7 @@ class HWC():
             #self.iq_header.dump_header()
 
             if self.iq_header.check_sync_word():
-                logging.critical("IQ header sync word check failed, exiting..")
+                self.logger.critical("IQ header sync word check failed, exiting..")
                 break
                 
             # IQ samples are currently not required in this module, hence this section is disabled
@@ -431,7 +446,6 @@ class HWC():
             # if incoming_payload_size > 0:
             	# iq_samples = buffer[1024:1024 + incoming_payload_size].view(dtype=np.complex64).reshape(self.iq_header.active_ant_chs, self.iq_header.cpi_length) [:,0:self.N_proc] 
                 
-            self.logger.debug("Type:{:d}, CPI: {:d}, State:{:s}".format(self.iq_header.frame_type, self.iq_header.cpi_index, self.current_state))
             ##############################################
             #  Hardware Controller Finite State Machine  #
             ##############################################
@@ -524,10 +538,10 @@ class HWC():
                                    self.track_lock_ctr_fd.seek(0, 0)
                                    ctr_char = self.track_lock_ctr_fd.read(1)
                                    if ctr_char == '1':
-                                       logging.info("User has approved track lock state initialization")
+                                       self.logger.info("User has approved track lock state initialization")
                                        self.track_lock_ctr_fd.seek(0, 0)
                                    else:
-                                       logging.info("Waiting for track lock init. approval")
+                                       self.logger.info("Waiting for track lock init. approval")
                                        track_lock_approval = False                               
                                if track_lock_approval:
                                    self._control_noise_source(noise_source_state=False)
@@ -575,16 +589,28 @@ class HWC():
 
 class CtrIfaceServer(threading.Thread):
             
-    def __init__(self, M):
+    def __init__(self, M, logger=None):
         """
             Initialize the Ethernet socket based control interface
             Parameters:
             -----------
             :param: M: Number of receiver channels in the system
             :type:  M: int
+            :param: logger: Optional logger instance
+            :type:  logger: logging.Logger or None
         """
 
-        self.logger = logging.getLogger(__name__)
+        if logger is not None:
+            self.logger = logger
+        else:
+            # Configure logger to output to stderr for subprocess capture
+            logging.basicConfig(
+                level=logging.DEBUG,
+                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                stream=sys.stderr
+            )
+            self.logger = logging.getLogger(__name__)
+            self.logger.setLevel(logging.DEBUG)
         threading.Thread.__init__(self)  
 
         # Control interface server parameters
